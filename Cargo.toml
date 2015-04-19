@@ -1,0 +1,13 @@
+[package]
+name = "pseudotcp"
+version = "0.0.1"
+description = "pseudo-TCP bindings for libnice"
+homepage = "https://github.com/manuels/pseudotcp.rs"
+license = " GPL-2.0"
+authors = ["Manuel Schölling <manuel.schoelling@gmx.de>"]
+
+[dependencies]
+bitflags = "*"
+libc = "*"
+log = "*"
+env_logger = "*"
