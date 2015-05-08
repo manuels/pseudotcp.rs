@@ -117,7 +117,7 @@ impl PseudoTcpStream {
 		thread::Builder::new().name("PseudoTcpStream clock".to_string()).spawn(move || {
 			loop {
 				let ptr = this.ptr.lock().unwrap();
-				let mut timeout_ms: libc::c_long = 0;
+				let mut timeout_ms: libc::c_ulong = 0;
 				let res = unsafe {
 					ffi::pseudo_tcp_socket_get_next_clock(*ptr, &mut timeout_ms)
 				};
@@ -126,6 +126,11 @@ impl PseudoTcpStream {
 					break;
 				}
 				drop(ptr);
+
+				let now = unsafe {
+					(ffi::g_get_monotonic_time() / 1000) as u64
+				};
+				timeout_ms -= now;
 
 				debug!("sleeping for {}ms", timeout_ms);
 				sleep_ms(timeout_ms as u32);

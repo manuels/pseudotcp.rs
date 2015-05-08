@@ -79,9 +79,15 @@ extern "C" {
 	pub fn pseudo_tcp_socket_get_type() -> libc::c_int;
 }
 
+#[link(name="gobject-2.0")]
 #[link(name="glib-2.0")]
 extern "C" {
 	pub fn g_type_init();
+}
+
+#[link(name="glib-2.0")]
+extern "C" {
+	pub fn g_get_monotonic_time() -> i64;
 }
 
 #[link(name="glib-2.0")]
@@ -163,7 +169,7 @@ int pseudo_tcp_socket_get_next_clock()
 */
 #[link(name="nice")]
 extern "C" {
-	pub fn pseudo_tcp_socket_get_next_clock(self_: *mut _PseudoTcpSocket, timeout: *mut libc::c_long) -> libc::c_int;
+	pub fn pseudo_tcp_socket_get_next_clock(self_: *mut _PseudoTcpSocket, timeout: *mut u64) -> libc::c_int;
 }
 
 
