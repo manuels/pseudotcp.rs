@@ -10,19 +10,59 @@ extern crate env_logger;
 mod bindings;
 
 use std::io::{Result,Error};
-use std::io::{Read,Write};
 use std::sync::mpsc::{Sender, Receiver};
 use std::sync::{Arc, Mutex, Condvar};
 use std::thread;
 use std::thread::sleep_ms;
 use std::mem;
+use std::ptr;
 use std::boxed::Box;
 
 use bindings as ffi;
 
-//extern fn on_connected(tcp: *mut libc::c_int, user_data: *mut libc::c_int) {
-extern fn on_connected(_: *mut libc::c_int, user_data: *mut libc::c_int) {
-	debug!("on_connected!");
+extern fn on_closed(_: *mut libc::c_int, _: libc::c_int, user_data: *mut libc::c_int) {
+	info!("on_closed()");
+	unsafe {
+		let user_data:*mut UserData = mem::transmute(user_data);
+
+		(*user_data).stream_tx = None;
+	};
+}
+
+extern fn on_readable(ptr: *mut libc::c_int, user_data: *mut libc::c_int) {
+	info!("on_readable()");
+	unsafe {
+		let user_data:*mut UserData = mem::transmute(user_data);
+
+		// we don't use the user_data ptr here because it's locked in
+		// the pseudo_tcp_socket_notify_packet block
+		//let ptr = (*user_data).ptr.lock().unwrap();
+
+		loop {
+			let mut buf = vec![0u8; 64*1024];
+			let len = ffi::pseudo_tcp_socket_recv(ptr as *mut bindings::_PseudoTcpSocket,
+			                                      buf.as_mut_ptr() as *mut i8,
+			                                      buf.len() as libc::c_int);
+			
+			info!("on_readable(): len={}", len);
+			if len >= 0 {
+				buf.truncate(len as usize);
+				match (*user_data).stream_tx {
+					Some(ref tx) => tx.send(buf).unwrap(),
+					None => break, /* stream already closed */
+				}
+			} else {
+				break;
+			}
+		}
+		drop(ptr);
+		
+		mem::forget(user_data);
+	}
+}
+
+extern fn on_connected(ptr: *mut libc::c_int, user_data: *mut libc::c_int) {
+	debug!("on_connected {:?}!", ptr);
 	unsafe {
 		let user_data:*mut UserData = mem::transmute(user_data);
 
@@ -45,24 +85,27 @@ extern "C" fn send(_:         *mut libc::c_int,
                    user_data: *mut libc::c_int)
 	-> libc::c_uint
 {
+	debug!("send callback");
 	unsafe {
 		let tx:*mut UserData = mem::transmute(user_data);
 
 		let buf = Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize);
 
-		(*tx).tx.send(buf.clone()).unwrap();
+		(*tx).dgram_tx.send(buf.clone()).unwrap();
 		debug!("sent len={}", buf.len());
 
 		mem::forget(tx);
 		mem::forget(buf);
 
-		return ffi::WR_SUCCESS.bits();
 	}
+	return ffi::WR_SUCCESS.bits();
 }
 
 struct UserData {
-	tx: Sender<Vec<u8>>,
-	connected: Arc<(Mutex<bool>,Condvar)>,
+	ptr:        Arc<Mutex<*mut ffi::_PseudoTcpSocket>>,
+	dgram_tx:   Sender<Vec<u8>>,
+	stream_tx:  Option<Sender<Vec<u8>>>,
+	connected:  Arc<(Mutex<bool>,Condvar)>,
 }
 
 impl Drop for UserData {
@@ -71,17 +114,24 @@ impl Drop for UserData {
 	}
 }
 
-struct PseudoTcpStream {
+pub struct PseudoTcpStream {
 	ptr:       Arc<Mutex<*mut ffi::_PseudoTcpSocket>>,
 	connected: Arc<(Mutex<bool>,Condvar)>,
 	callbacks: Arc<ffi::PseudoTcpCallbacks>,
 }
 
 impl PseudoTcpStream {
-	pub fn new_from(tx: Sender<Vec<u8>>, rx: Receiver<Vec<u8>>) -> PseudoTcpStream {
+	pub fn new_from(dgram_tx:  Sender<Vec<u8>>, dgram_rx:  Receiver<Vec<u8>>,
+	                stream_tx: Sender<Vec<u8>>, stream_rx: Receiver<Vec<u8>>)
+		-> PseudoTcpStream
+	{
+		let ptr = Arc::new(Mutex::new(ptr::null_mut()));
 		let connected = Arc::new((Mutex::new(false), Condvar::new()));
+
 		let x = UserData {
-			tx:        tx,
+			ptr:       ptr.clone(),
+			dgram_tx:  dgram_tx,
+			stream_tx: Some(stream_tx),
 			connected: connected.clone()
 		};
 		let mut user_data = Box::new(x);
@@ -90,25 +140,26 @@ impl PseudoTcpStream {
 		let mut callbacks = ffi::PseudoTcpCallbacks {
 			user_data:         unsafe { mem::transmute(&mut *user_data) },
 			PseudoTcpOpened:   Some(on_connected),
-			PseudoTcpReadable: None,
+			PseudoTcpReadable: Some(on_readable),
 			PseudoTcpWritable: None,
-			PseudoTcpClosed:   None,
+			PseudoTcpClosed:   Some(on_closed),
 			WritePacket:       Some(send),
 		};
 
 		unsafe {mem::forget(user_data)};
 
-		let ptr = unsafe {
-			ffi::pseudo_tcp_socket_new(conversation, &mut callbacks)
-		};
-		unsafe {
-			ffi::pseudo_tcp_set_debug_level(ffi::PSEUDO_TCP_DEBUG_VERBOSE.bits());
-		}
+		*(ptr.lock().unwrap()) = unsafe {
+			let ptr = ffi::pseudo_tcp_socket_new(conversation, &mut callbacks);
+			assert!(!ptr.is_null());
 
-		assert!(!ptr.is_null());
+			ffi::pseudo_tcp_set_debug_level(ffi::PSEUDO_TCP_DEBUG_VERBOSE.bits());
+
+			ptr
+		};
+
 
 		let stream = PseudoTcpStream {
-			ptr:       Arc::new(Mutex::new(ptr)),
+			ptr:       ptr.clone(),
 			connected: connected.clone(),
 			callbacks: Arc::new(callbacks),
 		};
@@ -143,9 +194,9 @@ impl PseudoTcpStream {
 		}).unwrap();
 
 		let this = stream.clone();
-		thread::Builder::new().name("PseudoTcpStream rx-to-tcp".to_string()).spawn(move || {
-			for buf in rx.iter() {
-				debug!("rx-to-tcp: got len={} on {:?}", buf.len() as libc::c_int, this.ptr);
+		thread::Builder::new().name("PseudoTcpStream rx dgram".to_string()).spawn(move || {
+			for buf in dgram_rx.iter() {
+				debug!("rx-dgram: got len={} on {:?}", buf.len() as libc::c_int, this.ptr);
 				let ptr = this.ptr.lock().unwrap();
 				let res = unsafe {
 					ffi::pseudo_tcp_socket_notify_packet(*ptr,
@@ -155,6 +206,39 @@ impl PseudoTcpStream {
 				drop(ptr);
 
 				assert!(res != ffi::FALSE);
+			}
+			warn!("fin!");
+		}).unwrap();
+
+		let this = stream.clone();
+		thread::Builder::new().name("PseudoTcpStream rx stream".to_string()).spawn(move || {
+			for buf in stream_rx.iter() {
+				loop {
+					debug!("rx-stream: got len={} on {:?}", buf.len() as libc::c_int, this.ptr);
+					let ptr = this.ptr.lock().unwrap();
+					let len = unsafe {
+						ffi::pseudo_tcp_socket_send(*ptr,
+							buf.as_ptr() as *const i8,
+							buf.len() as libc::c_int)
+					};
+					drop(ptr);
+
+					if len == -1 {
+						let err = this.get_last_error();
+						const EAGAIN: i32 = 11;
+						if err.raw_os_error().unwrap() == EAGAIN {
+							info!("error EAGAIN sending buffer, retrying...");
+							continue
+						} else {
+							panic!("{:?}", err);
+						}
+					}
+
+					if (len as usize) != buf.len() {
+						warn!("only sent {} of {} bytes", len, buf.len());
+					}
+					break;
+				}
 			}
 			warn!("fin!");
 		}).unwrap();
@@ -240,61 +324,8 @@ impl Clone for PseudoTcpStream {
 	}
 }
 
-impl Read for PseudoTcpStream {
-	fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-		let ptr = self.ptr.lock().unwrap();
-		let len = unsafe {
-			ffi::pseudo_tcp_socket_recv(*ptr,
-				buf.as_mut_ptr() as *mut i8,
-				buf.len() as libc::c_int)
-		};
-		drop(ptr);
-
-		if len < 0 {
-			Err(self.get_last_error())
-		} else {
-			Ok(len as usize)
-		}
-	}
-}
-
-impl Write for PseudoTcpStream {
-	fn write(&mut self, buf: &[u8]) -> Result<usize> {
-		let ptr = self.ptr.lock().unwrap();
-		let len = unsafe {
-			ffi::pseudo_tcp_socket_send(*ptr,
-				buf.as_ptr() as *const i8,
-				buf.len() as libc::c_int)
-		};
-		drop(ptr);
-
-		if len < 0 {
-			Err(self.get_last_error())
-		} else {
-			Ok(len as usize)
-		}
-	}
-
-	fn flush(&mut self) -> Result<()> {
-		/* noop */
-		Ok(())
-
-		/*
-		maybe something like
-			set_mtu(0);
-			pseudo_tcp_socket_notify_clock();
-		or
-			set_mtu(0);
-			pseudo_tcp_socket_send(buf.len=0)
-		works?
-		*/
-	}
-}
-
 #[cfg(test)]
 mod test {
-	use std::io::{Read,Write};
-	use std::io::ErrorKind;
 	use std::thread;
 	use std::sync::mpsc::channel;
 
@@ -308,13 +339,18 @@ mod test {
 			ffi::g_type_init()
 		};
 
-		let (tx_a, rx_b) = channel();
-		let (tx_b, rx_a) = channel();
+		let (dgram_tx_a, dgram_rx_b) = channel();
+		let (dgram_tx_b, dgram_rx_a) = channel();
+		let (left_stream_tx_a, left_stream_rx_b) = channel();
+		let (left_stream_tx_b, left_stream_rx_a) = channel();
+		let (right_stream_tx_a, right_stream_rx_b) = channel();
+		let (right_stream_tx_b, right_stream_rx_a) = channel();
 
-		let mut left  = super::PseudoTcpStream::new_from(tx_a, rx_a);
-		info!("new() done");
-		let mut right = super::PseudoTcpStream::new_from(tx_b, rx_b);
-		info!("new() done");
+		let left_tx = left_stream_tx_b;
+		let right_rx = right_stream_rx_b;
+
+		let left = super::PseudoTcpStream::new_from(dgram_tx_a, dgram_rx_a, left_stream_tx_a, left_stream_rx_a);
+		let right = super::PseudoTcpStream::new_from(dgram_tx_b, dgram_rx_b, right_stream_tx_a, right_stream_rx_a);
 
 		left.set_mtu(1500);
 		right.set_mtu(1500);
@@ -323,57 +359,23 @@ mod test {
 			left.connect().unwrap();
 			info!("connected!");
 
-			for _ in 0..10 {
-				for i in 0..1024*1024 as i64 {
-					let v = vec![i as u8];
+			for i in 0..10 as i64 {
+				let v = vec![i as u8; 1];
 
-					loop {
-						match left.write(&v[..]) {
-							Ok(_) => break,
-							Err(e) => {
-								if e.kind() == ErrorKind::WouldBlock {
-									continue
-								} else {
-									panic!("kind={:?}, desc={:?}", e.kind(), e)
-								}
-							},
-						}
-					}
-				}
-				info!("about to flush!");
-				left.flush().unwrap();
+				left_tx.send(v).unwrap();
 			}
 			left.close();
 			info!("all written!");
 		});
 
 		let mut i: i64 = 0;
-		for _ in 0..10 {
-			info!("i counter reset.");
-
-			let mut buf = vec![0; 1024*1024];
-
-			let mut len;
-			loop {
-				len = match right.read(&mut buf[..]) {
-					Ok(len) => len,
-					Err(e) => {
-						if e.kind() == ErrorKind::WouldBlock {
-							continue
-						} else {
-							panic!("kind={:?}, desc={:?}", e.kind(), e)
-						}
-					},
-				};
-				break
-			}
-
-			buf.truncate(len);
+		while i < 10 {
+			let buf = right_rx.recv().unwrap();
 			info!("test got len={}", buf.len());
 
 			for v in buf.iter() {
 				assert_eq!(*v, i as u8);
-				i = (i+1) % (1024*1024);
+				i = i+1;
 			}
 			info!("i={}", i);
 		}
