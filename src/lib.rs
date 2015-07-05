@@ -17,64 +17,76 @@ use std::thread::sleep_ms;
 use std::mem;
 use std::ptr;
 use std::boxed::Box;
-use libc::consts::os::posix88::EAGAIN;
+use libc::consts::os::posix88::EWOULDBLOCK;
 
 use bindings as ffi;
 
-extern fn on_closed(_: *mut libc::c_int, _: libc::c_int, user_data: *mut UserData) {
-	info!("on_closed()");
-	unsafe {
-		(*user_data).stream_tx = None;
+fn set_mutex<T>(var:   &Arc<(Mutex<T>,Condvar)>,
+                value: T)
+{
+	let &(ref lock, ref cvar) = &**var;
+	let mut guard = lock.lock().unwrap();
 
-		let &(ref lock, ref cvar) = &*(*user_data).connected;
-		let mut connected = lock.lock().unwrap();
-		*connected = false;
-		cvar.notify_all();
-	};
+	*guard = value;
+	cvar.notify_all();
 }
 
-extern fn on_readable(ptr: *mut libc::c_int, user_data: *mut UserData) {
+extern fn on_closed(_:         *mut libc::c_int,
+                    _:         libc::c_int,
+                    user_data: *mut UserData)
+{
+	info!("on_closed()");
+	let tx = unsafe {
+		&mut (*user_data).stream_tx
+	};
+	let connected = unsafe {
+		&(*user_data).connected
+	};
+
+	*tx = None;
+	set_mutex(connected, false);
+}
+
+extern fn on_readable(ptr:       *mut bindings::_PseudoTcpSocket,
+                      user_data: *mut UserData)
+{
 	debug!("on_readable()");
-	unsafe {
-		// we don't use the user_data ptr here because it's locked in
-		// the pseudo_tcp_socket_notify_packet block
-		//let ptr = (*user_data).ptr.lock().unwrap();
-		let ptr = ptr as *mut bindings::_PseudoTcpSocket;
 
-		loop {
-			let mut buf = vec![0u8; 64*1024];
-			let buf_ptr = buf.as_mut_ptr() as *mut i8;
-			let buf_len = buf.len() as libc::c_int;
+	// we don't use the user_data ptr here because it's locked in
+	// the pseudo_tcp_socket_notify_packet block
+	let stream_tx = unsafe { &(*user_data).stream_tx };
 
-			let len = ffi::pseudo_tcp_socket_recv(ptr, buf_ptr, buf_len);
-			
-			if len >= 0 {
-				buf.truncate(len as usize);
-				match (*user_data).stream_tx {
-					Some(ref tx) => tx.send(buf).unwrap(),
-					None => break, /* stream already closed */
-				}
-			} else {
-				warn!("on_readable(): len={}", len);
-				break;
-			}
-		}
-		drop(ptr);
+	while let &Some(ref tx) = stream_tx
+	{
+		let mut buf = vec![0u8; 64*1024];
+		let buf_ptr = buf.as_mut_ptr() as *mut i8;
+		let buf_len = buf.len() as libc::c_int;
+
+		let len = unsafe {
+			ffi::pseudo_tcp_socket_recv(ptr, buf_ptr, buf_len)
+		};
 		
-		mem::forget(user_data);
+		if len < 0 {
+			warn!("on_readable(): len={}", len);
+			break;
+		}
+
+		buf.truncate(len as usize);
+		
+		if let Err(err) = tx.send(buf) {
+			warn!("on_readable(): send failed: {:?}", err);
+			break;
+		}
 	}
 }
 
 extern fn on_connected(ptr: *mut libc::c_int, user_data: *mut UserData) {
 	debug!("on_connected {:?}!", ptr);
-	unsafe {
-		let &(ref lock, ref cvar) = &*(*user_data).connected;
-		let mut connected = lock.lock().unwrap();
-		*connected = true;
-		cvar.notify_all();
+	let connected = unsafe {
+		&(*user_data).connected
+	};
 
-		mem::forget(user_data);
-	}
+	set_mutex(connected, true);
 }
 
 extern "C" fn send(_:         *mut libc::c_int,
@@ -84,23 +96,21 @@ extern "C" fn send(_:         *mut libc::c_int,
 	-> libc::c_uint
 {
 	debug!("send callback");
-	unsafe {
-		let ref tx = (*user_data).dgram_tx;
-		let len    = len as usize;
-		let buf    = Vec::from_raw_parts(ptr, len, len);
 
-		let res = tx.send(buf.clone());
+	let buf = unsafe {
+		std::slice::from_raw_parts(ptr, len as usize)
+		           .to_vec()
+	};
 
-		if let Err(err) = res {
+	let ref tx = unsafe { &(*user_data).dgram_tx };
+
+	match tx.send(buf) {
+		Ok(_)    => ffi::WR_SUCCESS.bits(),
+		Err(err) => {
 			warn!("Sent failed: {:?}", err);
-			return ffi::WR_FAIL.bits();
-		}
-
-		mem::forget(user_data);
-		mem::forget(buf);
+			ffi::WR_FAIL.bits()
+		},
 	}
-
-	return ffi::WR_SUCCESS.bits();
 }
 
 struct UserData {
@@ -118,6 +128,7 @@ impl Drop for UserData {
 
 pub struct PseudoTcpStream {
 	ptr:       Arc<Mutex<*mut ffi::_PseudoTcpSocket>>,
+	user_data: Arc<Box<UserData>>,
 	connected: Arc<(Mutex<bool>,Condvar)>,
 	callbacks: Arc<ffi::PseudoTcpCallbacks>,
 }
@@ -138,7 +149,6 @@ impl PseudoTcpStream {
 		};
 		let mut user_data = Box::new(x);
 
-		let conversation = 1;
 		let mut callbacks = unsafe { 
 			ffi::PseudoTcpCallbacks {
 				user_data:         mem::transmute(&mut *user_data),
@@ -150,37 +160,35 @@ impl PseudoTcpStream {
 			}
 		};
 
-		mem::forget(user_data);
+//		mem::forget(user_data);
 
-		*(ptr.lock().unwrap()) = unsafe {
-			let ptr = ffi::pseudo_tcp_socket_new(conversation, &mut callbacks);
-			assert!(!ptr.is_null());
-
-			let level = ffi::PSEUDO_TCP_DEBUG_VERBOSE.bits();
-			ffi::pseudo_tcp_set_debug_level(level);
-
-			ptr
+		let conversation = 1;
+		let raw_ptr = unsafe {
+			ffi::pseudo_tcp_socket_new(conversation, &mut callbacks)
 		};
+		assert!(!raw_ptr.is_null());
+		*(ptr.lock().unwrap()) = raw_ptr;
 
 		let stream = PseudoTcpStream {
 			ptr:       ptr.clone(),
 			connected: connected.clone(),
+			user_data: Arc::new(user_data),
 			callbacks: Arc::new(callbacks),
 		};
 
 		let this = stream.clone();
-		Self::spawn_clock(this);
+		Self::spawn_clock(this).unwrap();
 
 		let this = stream.clone();
-		Self::spawn_read_dgram(this, dgram_rx);
+		Self::spawn_read_dgram(this, dgram_rx).unwrap();
 
 		let this = stream.clone();
-		Self::spawn_read_stream(this, stream_rx);
+		Self::spawn_read_stream(this, stream_rx).unwrap();
 
 		stream
 	}
 
-	fn spawn_clock(this: PseudoTcpStream) {
+	fn spawn_clock(this: PseudoTcpStream) -> Result<thread::JoinHandle<()>> {
 		let name = "PseudoTcpStream clock".to_string();
 
 		thread::Builder::new().name(name).spawn(move || {
@@ -191,8 +199,9 @@ impl PseudoTcpStream {
 					let ptr = this.ptr.lock().unwrap();
 					ffi::pseudo_tcp_socket_get_next_clock(*ptr, &mut timeout_ms)
 				};
-				if res == ffi::FALSE {
-					// socket was closed
+
+				let socket_is_closed = (res == ffi::FALSE);
+				if socket_is_closed {
 					break;
 				}
 
@@ -209,24 +218,24 @@ impl PseudoTcpStream {
 					ffi::pseudo_tcp_socket_notify_clock(*ptr)
 				};
 			}
-		}).unwrap();
+		})
 	}
 
 
-	fn spawn_read_dgram(this: PseudoTcpStream, dgram_rx: Receiver<Vec<u8>>) {
-		thread::Builder::new().name("PseudoTcpStream rx dgram".to_string()).spawn(move || {
+	fn spawn_read_dgram(this: PseudoTcpStream, dgram_rx: Receiver<Vec<u8>>)
+		-> Result<thread::JoinHandle<()>>
+	{
+		let name = "PseudoTcpStream rx dgram".to_string();
+
+		thread::Builder::new().name(name).spawn(move || {
 			for buf in dgram_rx.iter() {
 				let buf_ptr = buf.as_ptr() as *const i32;
 				let buf_len = buf.len() as libc::c_int;
 
-				debug!("rx-dgram: got len={} on {:?} locking...", buf_len, this.ptr);
 				let res = unsafe {
 					let ptr = this.ptr.lock().unwrap();
-					debug!("rx-dgram: locked.");
-
 					ffi::pseudo_tcp_socket_notify_packet(*ptr, buf_ptr, buf_len)
 				};
-				debug!("rx-dgram: unlocked.");
 
 				assert!(res != ffi::FALSE);
 			}
@@ -236,22 +245,19 @@ impl PseudoTcpStream {
 				let ptr = this.ptr.lock().unwrap();
 				ffi::pseudo_tcp_socket_close(*ptr, ffi::TRUE)
 			};
-		}).unwrap();
+		})
 	}
 
-	fn spawn_read_stream(this: PseudoTcpStream, stream_rx: Receiver<Vec<u8>>) {
+	fn spawn_read_stream(this: PseudoTcpStream, stream_rx: Receiver<Vec<u8>>)
+		-> Result<thread::JoinHandle<()>>
+	{
 		thread::Builder::new().name("PseudoTcpStream rx stream".to_string()).spawn(move || {
 			this.wait_for_connection();
 
-			for buf in stream_rx.iter() {
-				loop {
-					debug!("rx-stream: got len={} on {:?}", buf.len() as libc::c_int, this.ptr);
-					let &(ref lock, _) = &*this.connected;
-					let connected = lock.lock().unwrap();
-					if !*connected {
-						break
-					}
+			for buf in stream_rx.iter().take_while(|_| this.is_connected()) {
+				debug!("rx-stream: got len={} on {:?}", buf.len() as libc::c_int, this.ptr);
 
+				while this.is_connected() {
 					let buf_ptr = buf.as_ptr() as *const i8;
 					let buf_len = buf.len() as libc::c_int;
 
@@ -259,26 +265,23 @@ impl PseudoTcpStream {
 						let ptr = this.ptr.lock().unwrap();
 						ffi::pseudo_tcp_socket_send(*ptr, buf_ptr, buf_len)
 					};
-	
-					if len == -1 {
-						let err = this.get_last_error();
-						
-						if err.raw_os_error() == Some(EAGAIN) {
-							info!("error EAGAIN sending buffer, retrying...");
-							continue
-						} else {
-							error!("{:?}", err);
-							
-							let &(ref lock, ref cvar) = &*this.connected;
-							let mut connected = lock.lock().unwrap();
-							*connected = false;
-							cvar.notify_all();
-						}
-					} else if (len as usize) != buf.len() {
-						warn!("only sent {} of {} bytes", len, buf.len());
-					}
 
-					break;
+					if len >= buf_len {
+						if (len as usize) != buf.len() {
+							warn!("only sent {} of {} bytes", len, buf.len());
+						}
+
+						break
+					}
+	
+					let err = this.get_last_error();
+					if err.raw_os_error() != Some(EWOULDBLOCK) {
+						error!("{:?}", err);
+						set_mutex(&this.connected, false);
+					} else {
+						info!("error EWOULDBLOCK sending buffer, retrying...");
+						break
+					}
 				}
 			}
 
@@ -287,7 +290,7 @@ impl PseudoTcpStream {
 				let ptr = this.ptr.lock().unwrap();
 				ffi::pseudo_tcp_socket_close(*ptr, ffi::TRUE)
 			};
-		}).unwrap();
+		})
 	}
 
 	pub fn connect(&self) -> Result<()> {
@@ -302,6 +305,12 @@ impl PseudoTcpStream {
 		} else {
 			Err(self.get_last_error())
 		}
+	}
+
+	fn is_connected(&self) -> bool {
+			let &(ref lock, _) = &*self.connected;
+			let connected = lock.lock().unwrap();
+			*connected
 	}
 
 	fn wait_for_connection(&self) {
@@ -357,9 +366,11 @@ impl Clone for PseudoTcpStream {
 	fn clone(&self) -> PseudoTcpStream {
 		let stream = PseudoTcpStream {
 			ptr:       self.ptr.clone(),
+			user_data: self.user_data.clone(),
 			connected: self.connected.clone(),
 			callbacks: self.callbacks.clone(),
 		};
+
 		let ptr = self.ptr.lock().unwrap();
 		unsafe {
 			ffi::g_object_ref(*ptr)
