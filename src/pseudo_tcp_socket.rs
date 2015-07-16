@@ -69,7 +69,7 @@ impl PseudoTcpSocket {
 			adjust_clock: adjust_clock,
 		};
 
-		socket.spawn_receiver(rx);
+		socket.spawn_udp_receiver(rx);
 		socket.spawn_clock(tx);
 
 		socket
@@ -146,7 +146,7 @@ impl PseudoTcpSocket {
 		})
 	}
 
-	fn spawn_receiver(&self, rx: Receiver<Vec<u8>>) -> thread::JoinHandle<()> {
+	fn spawn_udp_receiver(&self, rx: Receiver<Vec<u8>>) -> thread::JoinHandle<()> {
 		let tcp = self.tcp.clone();
 		let adjust_clock = self.adjust_clock.clone();
 
@@ -179,11 +179,23 @@ impl PseudoTcpSocket {
 
 impl io::Read for PseudoTcpSocket {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		self.readable.wait_for(true).unwrap();
+		// do NOT wait for self.readable here: if the connection is closed,
+		// we will never satisfy it!
+		// self.readable.wait_for(true).unwrap();
 
 		let res = {
 			let lock = self.tcp.lock().unwrap();
-			lock.recv(buf)
+			let res = lock.recv(buf);
+
+			if let Err(ref err) = res {
+				if err.kind() == io::ErrorKind::WouldBlock {
+					// We must keep the lock to ensure that readable callback
+					// is not called before we set self.readable to false!
+					self.readable.set(false, Notify::All);
+				}
+			}
+
+			res
 		};
 		self.adjust_clock();
 
@@ -202,18 +214,31 @@ impl io::Read for PseudoTcpSocket {
 			return Err(error);
 		}
 
-		// TODO set readable = false ???
 		res
 	}
 }
 
 impl io::Write for PseudoTcpSocket {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		self.connected.wait_for(true).unwrap();
+		// do NOT wait for self.connected here: if the connection is closed,
+		// we will never satisfy it!
+		// self.connected.wait_for(true).unwrap();
 
 		let res = {
 			let lock = self.tcp.lock().unwrap();
-			lock.send(buf)
+			let res = lock.send(buf);
+
+			match res {
+				Ok(len) if len < buf.len() => {
+					self.writable.set(false, Notify::All);
+				},
+				Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+					self.writable.set(false, Notify::All);
+				}
+				_ => (),
+			}
+
+			res
 		};
 		self.adjust_clock();
 
@@ -240,13 +265,20 @@ fn test() {
 	alice.notify_mtu(1496);
 	bob.notify_mtu(1496);
 
+	assert!(alice.connect());
+	// TODO:
+	//	alice.connected.wait_for_ms(true, 40000).unwrap();
+	//	bob.connected.wait_for_ms(true, 40000).unwrap();
+	alice.connected.wait_for(true).unwrap();
+	bob.connected.wait_for(true).unwrap();
+
+
 	let n_iter = 100;
 
 	thread::spawn(move || {
-		assert!(alice.connect());
-
 		let mut count = 0;
 		let buf = [0; 10*1024];
+
 		for _ in 0..n_iter {
 			let mut pos = 0;
 			while pos < buf.len() {
