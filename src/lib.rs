@@ -8,6 +8,9 @@ extern crate libc;
 extern crate env_logger;
 
 mod bindings;
+mod api;
+mod condition_variable;
+mod pseudo_tcp_socket;
 
 use std::io::{Result,Error};
 use std::sync::mpsc::{Sender, Receiver};
@@ -18,6 +21,7 @@ use std::mem;
 use std::ptr;
 use std::boxed::Box;
 use libc::consts::os::posix88::EWOULDBLOCK;
+use std::ffi::CString;
 
 use bindings as ffi;
 
@@ -328,6 +332,22 @@ impl PseudoTcpStream {
 		}
 	}
 
+	pub fn set_no_delay(&self, val: bool) {
+		//unimplemented!();
+		
+		let guard = self.ptr.lock().unwrap();
+		let ptr = (*guard) as *const libc::c_void;
+
+		let name = &b"no-delay"[..];
+		let prop = CString::new(name).unwrap();
+		
+		let gval = if val {!ffi::FALSE} else {ffi::FALSE};
+
+		unsafe {
+			ffi::g_object_set(ptr, prop.as_ptr(), gval, std::ptr::null())
+		}
+	}
+
 	pub fn force_close(self) {
 		let ptr = self.ptr.lock().unwrap();
 		unsafe {
@@ -379,7 +399,7 @@ impl Clone for PseudoTcpStream {
 		stream
 	}
 }
-
+/*
 #[cfg(test)]
 mod test {
 	use std::thread;
@@ -411,6 +431,9 @@ mod test {
 		left.set_mtu(1500);
 		right.set_mtu(1500);
 
+		left.set_no_delay(true);
+		right.set_no_delay(false);
+
 		thread::spawn(move || {
 			left.connect().unwrap();
 			info!("connected!");
@@ -438,3 +461,4 @@ mod test {
 		}
 	}
 }
+*/

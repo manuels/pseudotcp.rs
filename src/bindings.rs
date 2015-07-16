@@ -33,6 +33,14 @@ pub struct _PseudoTcpSocket {
 	priv_: *mut _PseudoTcpSocketPrivate,
 }
 
+extern "C" {
+	#[link(name="glib-2.0")]
+	pub fn g_object_set(instance:      *const libc::c_void,
+	                    property_name: *const libc::c_char,
+	                    value:         libc::c_int,
+	                    null:          *const libc::c_char);
+}
+
 /*
 struct 
 		(int) user_data
