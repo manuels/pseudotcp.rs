@@ -208,8 +208,6 @@ impl io::Read for PseudoTcpSocket {
 		};
 
 		if disconnected {
-			self.close(false);
-
 			let error = io::Error::new(io::ErrorKind::NotConnected, "");
 			return Err(error);
 		}
@@ -323,6 +321,7 @@ fn test() {
 		}
 		assert!(buf.iter().all(|x| *x == 0x0));
 	}
+	bob.close(true);
 
 	assert_eq!(count, n_iter*buf.len());
 }
