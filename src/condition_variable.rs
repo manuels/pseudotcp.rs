@@ -1,6 +1,8 @@
 use std::cmp::PartialEq;
 use std::sync::{Mutex, Condvar, PoisonError, MutexGuard, LockResult};
 
+use time;
+
 pub enum Notify {
 	One,
 	All,
@@ -46,6 +48,24 @@ impl<T:PartialEq+Clone> ConditionVariable<T> {
 		}
 
 		Ok(())
+	}
+
+	pub fn wait_for_ms(&self, expected: T, timeout_ms: i64) -> Result<bool, PoisonError<(MutexGuard<T>,bool)>> {
+		let &(ref lock, ref cvar) = &self.pair;
+		let mut actual = lock.lock().unwrap();
+
+		let mut remaining_ms = timeout_ms;
+		while *actual != expected && remaining_ms > 0 {
+			let before_ms = time::precise_time_ns()/1000;
+
+			let (new, _) = try!(cvar.wait_timeout_ms(actual, remaining_ms as u32));
+			actual = new;
+
+			let after_ms = time::precise_time_ns()/1000;
+			remaining_ms -= (after_ms - before_ms) as i64;
+		}
+
+		Ok(*actual == expected)
 	}
 }
 

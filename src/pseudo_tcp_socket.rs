@@ -4,8 +4,6 @@ use std::thread;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, Receiver, channel};
 
-use env_logger;
-
 use api;
 use bindings as ffi;
 use condition_variable::{ConditionVariable, Notify};
@@ -13,16 +11,32 @@ use condition_variable::{ConditionVariable, Notify};
 const CONVERSATION_ID:i32 = 0xFEED;
 const FIN:[u8;2] = [0xDE, 0xAD];
 
-pub struct PseudoTcpSocket {
+pub struct PseudoTcpSocket;
+pub struct PseudoTcpChannel;
+
+pub struct PseudoTcpStream {
 	tcp:           Arc<Mutex<api::PseudoTcpSocket>>,
 	connected:     Arc<ConditionVariable<bool>>,
 	readable:      Arc<ConditionVariable<bool>>,
 	writable:      Arc<ConditionVariable<bool>>,
-	adjust_clock:  Arc<ConditionVariable<()>>,
+	notify_clock:  Arc<ConditionVariable<()>>,
 }
 
 impl PseudoTcpSocket {
-	pub fn new(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>)) -> PseudoTcpSocket {
+	/// waits for a connection in the background
+	pub fn listen(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>)) -> PseudoTcpStream {
+		PseudoTcpStream::new(ch)
+	}
+
+	pub fn connect(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>)) -> io::Result<PseudoTcpStream> {
+		let stream = PseudoTcpStream::new(ch);
+		
+		stream.connect().map(|_| stream)
+	}
+}
+
+impl PseudoTcpStream {
+	fn new(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>)) -> PseudoTcpStream {
 		let (tx, rx) = ch;
 
 		let connected = Arc::new(ConditionVariable::new(false));
@@ -37,8 +51,6 @@ impl PseudoTcpSocket {
 			let connected2 = connected.clone();
 
 			let write_packet = move |buf: &[u8]| {
-				debug!("write_packet len={} first bytes={:x} {:x} {:x} {:x}", buf.len(), buf[0], buf[1], buf[2], buf[3]);
-
 				match tx.send(buf.to_vec()) {
 					Ok(()) => ffi::WR_SUCCESS,
 					Err(err) => {
@@ -59,14 +71,14 @@ impl PseudoTcpSocket {
 
 		let tcp = api::PseudoTcpSocket::new(CONVERSATION_ID, callbacks);
 		let tcp = Arc::new(Mutex::new(tcp));
-		let adjust_clock = Arc::new(ConditionVariable::new(()));
+		let notify_clock = Arc::new(ConditionVariable::new(()));
 
-		let socket = PseudoTcpSocket {
+		let socket = PseudoTcpStream {
 			tcp:           tcp,
 			readable:      readable,
 			writable:      writable,
 			connected:     connected,
-			adjust_clock: adjust_clock,
+			notify_clock: notify_clock,
 		};
 
 		socket.spawn_udp_receiver(rx);
@@ -75,18 +87,23 @@ impl PseudoTcpSocket {
 		socket
 	}
 
-	#[must_use]
-	pub fn connect(&self) -> bool {
+	fn connect(&self) -> io::Result<()> {
 		let res = {
 			let lock = self.tcp.lock().unwrap();
 			lock.connect()
 		};
+
 		self.adjust_clock();
-		
 		res
 	}
 
-	pub fn close(&mut self, force: bool) {
+	/// use this for the listening socket
+	pub fn wait_for_connection(&self, timeout_ms: i64) -> bool
+	{
+		self.connected.wait_for_ms(true, timeout_ms).unwrap()
+	}
+
+	pub fn close(&self, force: bool) {
 		{
 			let lock = self.tcp.lock().unwrap();
 			lock.close(force);
@@ -111,11 +128,15 @@ impl PseudoTcpSocket {
 	}
 
 	fn adjust_clock(&self) {
-		(*self.adjust_clock).set((), Notify::All)
+		Self::do_adjust_clock(&self.notify_clock);
 	}
 
-	pub fn spawn_clock(&self, tx: Sender<Vec<u8>>) -> thread::JoinHandle<()> {
-		let adjust_clock = self.adjust_clock.clone();
+	fn do_adjust_clock(notify_clock:  &Arc<ConditionVariable<()>>) {
+		(*notify_clock).set((), Notify::All)
+	}
+
+	fn spawn_clock(&self, tx: Sender<Vec<u8>>) -> thread::JoinHandle<()> {
+		let notify_clock = self.notify_clock.clone();
 		let connected     = self.connected.clone();
 		let tcp = self.tcp.clone();
 
@@ -123,7 +144,7 @@ impl PseudoTcpSocket {
 			let mut timer = Some(0);
 			
 			while let Some(timeout_ms) = timer {
-				(*adjust_clock).wait_ms(timeout_ms as u32).unwrap();
+				(*notify_clock).wait_ms(timeout_ms as u32).unwrap();
 
 				timer = {
 					let lock = tcp.lock().unwrap();
@@ -137,8 +158,8 @@ impl PseudoTcpSocket {
 			// apparently libnice v0.0.11 does not take care of telling the
 			// other peer that the connection was closed.
 			// This is fixed in the latest libnice version!
-			// We do this by sending FIN (0xDEADFEED) over the wire. Usual
-			// libnice packets begin with the conversation id (0xFEEDF00D).
+			// We do this by sending FIN (0xDEAD) over the wire. Usual
+			// libnice packets begin with the conversation id (0xFEED).
 			let _ = tx.send(FIN.to_vec());
 
 			debug!("tcp socket: finished closing socket.");
@@ -148,37 +169,37 @@ impl PseudoTcpSocket {
 
 	fn spawn_udp_receiver(&self, rx: Receiver<Vec<u8>>) -> thread::JoinHandle<()> {
 		let tcp = self.tcp.clone();
-		let adjust_clock = self.adjust_clock.clone();
+		let notify_clock = self.notify_clock.clone();
 
 		thread::spawn(move || {
 			for buf in rx {
 				let lock = tcp.lock().unwrap();
 
 				// Usual libnice packets begin with the conversation id which is
-				// 0xFEEDF00D in our case. (see PseudoTcpSocket::spawn_clock())
+				// 0xFEED in our case. (see PseudoTcpStream::spawn_clock())
 				if buf == FIN {
-
 					info!("Got FIN!");
-					return lock.close(false);
-				}
+					lock.close(false);
 
-				let res = lock.notify_packet(&buf[..]);
-				if !res {
-					warn!("notify_packet failed!");
+					continue
+				} else {
+					let res = lock.notify_packet(&buf[..]);
+					if !res {
+						warn!("notify_packet failed!");
+					}
 				}
 
 				// the next line is the same as self.adjust_clock():
-				(*adjust_clock).set((), Notify::All)
+				Self::do_adjust_clock(&notify_clock);
 			}
 
 			let lock = tcp.lock().unwrap();
 			lock.close(false);
 		})
 	}
-}
 
-impl io::Read for PseudoTcpSocket {
-	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+	fn recv(&self, buf: &mut [u8]) -> io::Result<usize>
+	{
 		// do NOT wait for self.readable here: if the connection is closed,
 		// we will never satisfy it!
 		// self.readable.wait_for(true).unwrap();
@@ -197,6 +218,7 @@ impl io::Read for PseudoTcpSocket {
 
 			res
 		};
+
 		self.adjust_clock();
 
 		let disconnected = match res {
@@ -214,10 +236,9 @@ impl io::Read for PseudoTcpSocket {
 
 		res
 	}
-}
 
-impl io::Write for PseudoTcpSocket {
-	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+	fn send(&self, buf: &[u8]) -> io::Result<usize>
+	{
 		// do NOT wait for self.connected here: if the connection is closed,
 		// we will never satisfy it!
 		// self.connected.wait_for(true).unwrap();
@@ -243,85 +264,104 @@ impl io::Write for PseudoTcpSocket {
 		res
 	}
 
+	pub fn to_channel(self) -> (Sender<Vec<u8>>, Receiver<Vec<u8>>) {
+		PseudoTcpChannel::new(self)
+	}
+}
+
+impl io::Read for PseudoTcpStream {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		self.recv(buf)
+	}
+}
+
+impl io::Write for PseudoTcpStream {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		self.send(buf)
+	}
+
 	fn flush(&mut self) -> io::Result<()> {
 		Ok(()) //TODO (is that even possible?)
 	}
 }
 
-#[test]
-fn test() {
-	env_logger::init().unwrap();
+impl PseudoTcpChannel {
+	fn new(tcp: PseudoTcpStream) -> (Sender<Vec<u8>>, Receiver<Vec<u8>>) {
+		let (tx_a, rx_b) = channel();
+		let (tx_b, rx_a) = channel();
 
-	let (tx_a, rx_b) = channel();
-	let (tx_b, rx_a) = channel();
+		let tcp = Arc::new(tcp);
+		Self::spawn_tcp_sender(&tcp, rx_a);
+		Self::spawn_tcp_receiver(&tcp, tx_a);
 
-	PseudoTcpSocket::set_debug_level(ffi::PSEUDO_TCP_DEBUG_VERBOSE);
+		(tx_b, rx_b)
+	}
 
-	let mut alice = PseudoTcpSocket::new((tx_a, rx_a));
-	let mut bob   = PseudoTcpSocket::new((tx_b, rx_b));
+	fn spawn_tcp_sender(tcp: &Arc<PseudoTcpStream>, rx: Receiver<Vec<u8>>) -> thread::JoinHandle<()>
+	{
+		let tcp = tcp.clone();
 
-	alice.notify_mtu(1496);
-	bob.notify_mtu(1496);
+		thread::spawn(move || {
+			tcp.connected.wait_for(true).unwrap();
 
-	assert!(alice.connect());
-	// TODO:
-	//	alice.connected.wait_for_ms(true, 40000).unwrap();
-	//	bob.connected.wait_for_ms(true, 40000).unwrap();
-	alice.connected.wait_for(true).unwrap();
-	bob.connected.wait_for(true).unwrap();
+			let mut is_connected = true;
 
+			for buf in rx.iter() {
+				if !is_connected {
+					break
+				}
 
-	let n_iter = 100;
+				let mut pos = 0;
 
-	thread::spawn(move || {
-		let mut count = 0;
-		let buf = [0; 10*1024];
+				while pos < buf.len() {
+					let res = tcp.send(&buf[pos..]);
 
-		for _ in 0..n_iter {
-			let mut pos = 0;
-			while pos < buf.len() {
-				match alice.write(&buf[pos..]) {
-					Ok(len) => {
-						count += len;
-						pos += len;
-					},
-					Err(error) => {
-						if error.kind() == io::ErrorKind::WouldBlock {
-							continue
+					match res {
+						Ok(len) => pos += len,
+						Err(ref err) => {
+							match err.kind() {
+								io::ErrorKind::WouldBlock => tcp.writable.wait_for(true).unwrap(),
+								io::ErrorKind::NotConnected => is_connected = false,
+								_ => panic!("{:?}", err),
+							}
 						}
-						panic!(error);
 					}
 				}
 			}
-		}
 
-		debug!("alice.close()");
-		alice.close(false);
-		info!("alice done and sent {} bytes.", count);
-	});
-
-	let mut count = 0;
-	let mut buf = vec![0; 10*1024];
-
-	let mut is_connected = true;
-	while is_connected {
-		match bob.read(&mut buf[..]) {
-			Ok(len)  => count += len,
-			Err(err) => {
-				debug!("bob.read = {:?}", err);
-
-				match err.kind() {
-					io::ErrorKind::WouldBlock => continue,
-					io::ErrorKind::NotConnected => is_connected = false,
-					_ => panic!(err),
-				}
-
-				thread::sleep_ms(100);
-			}
-		}
-		assert!(buf.iter().all(|x| *x == 0x0));
+			debug!("Closing stream.");
+			tcp.close(false);
+		})
 	}
-	bob.close(true);
 
-	assert_eq!(count, n_iter*buf.len());
+	fn spawn_tcp_receiver(tcp: &Arc<PseudoTcpStream>, tx: Sender<Vec<u8>>) -> thread::JoinHandle<()>
+	{
+		let tcp = tcp.clone();
+
+		thread::spawn(move || {
+			let mut buf = [0; 10*1024];
+
+			tcp.connected.wait_for(true).unwrap();
+
+			// We cannot use tcp.connected here because there there might
+			// pending notify_packets that were not processed by PseudoTcpSocket
+			let mut is_connected = true;
+			while is_connected {
+				let res = tcp.recv(&mut buf);
+
+				match res {
+					Ok(len) => tx.send(buf[..len].to_vec()).unwrap(),
+					Err(ref err) => {
+						match err.kind() {
+							io::ErrorKind::WouldBlock => tcp.readable.wait_for(true).unwrap(),
+							io::ErrorKind::NotConnected => is_connected = false,
+							_ => panic!("{:?}", err),
+						}
+					}
+				}
+			}
+			debug!("Peer disconnected.");
+		})
+	}
+
 }

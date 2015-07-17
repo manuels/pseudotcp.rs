@@ -1,6 +1,6 @@
 [package]
 name = "pseudotcp"
-version = "0.0.1"
+version = "0.1.0"
 description = "pseudo-TCP bindings for libnice"
 homepage = "https://github.com/manuels/pseudotcp.rs"
 license = " GPL-2.0"
@@ -11,3 +11,4 @@ bitflags = "*"
 libc = "*"
 log = "*"
 env_logger = "*"
+time = "*"

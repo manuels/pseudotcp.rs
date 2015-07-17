@@ -158,15 +158,15 @@ impl PseudoTcpSocket {
 	}
 
 	#[must_use]
-	pub fn connect(&self) -> bool {
+	pub fn connect(&self) -> io::Result<()> {
 		let res = unsafe {
 			ffi::pseudo_tcp_socket_connect(self.ptr)
 		};
 
 		if res == ffi::FALSE {
-			false
+			Err(self.get_error().unwrap())
 		} else {
-			true
+			Ok(())
 		}
 	}
 
