@@ -7,10 +7,10 @@ extern crate log;
 extern crate libc;
 extern crate env_logger;
 extern crate time;
+extern crate condition_variable;
 
 mod bindings;
 mod api;
-mod condition_variable;
 mod pseudo_tcp_socket;
 
 #[cfg(test)]
