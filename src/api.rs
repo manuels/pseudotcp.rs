@@ -219,7 +219,8 @@ impl PseudoTcpSocket {
 		};
 
 		if res < 0 {
-			Err(self.get_error().unwrap())
+			let error = self.get_error().unwrap();
+			Err(error)
 		} else {
 			Ok(res as usize)
 		}
@@ -234,9 +235,7 @@ impl PseudoTcpSocket {
 		};
 
 		if res < 0 {
-			let error = self.get_error().unwrap();
-			debug!("pseudo_tcp_socket_recv()=={:?}", error);
-			Err(error)
+			Err(self.get_error().unwrap())
 		}
 		else {
 			Ok(res as usize)

@@ -4,6 +4,8 @@ use std::thread;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, Receiver, channel};
 
+use libc::consts::os::posix88::EAGAIN;
+
 use api;
 use bindings as ffi;
 use condition_variable::{ConditionVariable, Notify};
@@ -137,13 +139,15 @@ impl PseudoTcpStream {
 
 	fn spawn_clock(&self, tx: Sender<Vec<u8>>) -> thread::JoinHandle<()> {
 		let notify_clock = self.notify_clock.clone();
-		let connected     = self.connected.clone();
+		let connected    = self.connected.clone();
+		let readable     = self.readable.clone();
 		let tcp = self.tcp.clone();
 
 		thread::spawn(move || {
 			let mut timer = Some(0);
 			
 			while let Some(timeout_ms) = timer {
+				debug!("clock: {:?}", timeout_ms);
 				(*notify_clock).wait_ms(timeout_ms as u32).unwrap();
 
 				timer = {
@@ -163,6 +167,7 @@ impl PseudoTcpStream {
 			let _ = tx.send(FIN.to_vec());
 
 			debug!("tcp socket: finished closing socket.");
+			readable.touch(Notify::All);
 			connected.set(false, Notify::All);
 		})
 	}
@@ -181,7 +186,7 @@ impl PseudoTcpStream {
 					info!("Got FIN!");
 					lock.close(false);
 
-					continue
+					break
 				} else {
 					let res = lock.notify_packet(&buf[..]);
 					if !res {
@@ -195,6 +200,7 @@ impl PseudoTcpStream {
 
 			let lock = tcp.lock().unwrap();
 			lock.close(false);
+			info!("Socket was closed from remote!");
 		})
 	}
 
@@ -208,15 +214,18 @@ impl PseudoTcpStream {
 			let lock = self.tcp.lock().unwrap();
 			let res = lock.recv(buf);
 
-			if let Err(ref err) = res {
-				if err.kind() == io::ErrorKind::WouldBlock {
+			if let Err(err) = res {
+				if err.raw_os_error() == Some(EAGAIN) {
 					// We must keep the lock to ensure that readable callback
 					// is not called before we set self.readable to false!
 					self.readable.set(false, Notify::All);
+				} else {
+					debug!("pseudo_tcp_socket_recv()=={:?}", err);
 				}
+				Err(err)
+			} else {
+				res
 			}
-
-			res
 		};
 
 		self.adjust_clock();
@@ -306,7 +315,8 @@ impl PseudoTcpChannel {
 
 			let mut is_connected = true;
 
-			for buf in rx.iter() {
+			// TODO: how to close rx on FIN?
+			for buf in rx {
 				if !is_connected {
 					break
 				}
@@ -347,13 +357,23 @@ impl PseudoTcpChannel {
 			// pending notify_packets that were not processed by PseudoTcpSocket
 			let mut is_connected = true;
 			while is_connected {
+				debug!("Recv()'ing...");
 				let res = tcp.recv(&mut buf);
+				debug!("Recv()'ed.");
 
 				match res {
 					Ok(len) => tx.send(buf[..len].to_vec()).unwrap(),
 					Err(ref err) => {
 						match err.kind() {
-							io::ErrorKind::WouldBlock => tcp.readable.wait_for(true).unwrap(),
+							io::ErrorKind::WouldBlock => {
+								debug!("readable.wait_for...");
+								tcp.readable.wait_for_condition(|r|
+									*r || !tcp.connected.get().unwrap()
+								).unwrap();
+
+								is_connected = tcp.connected.get().unwrap();
+								debug!("readable.wait_for. done");
+							},
 							io::ErrorKind::NotConnected => is_connected = false,
 							_ => panic!("{:?}", err),
 						}
@@ -363,5 +383,4 @@ impl PseudoTcpChannel {
 			debug!("Peer disconnected.");
 		})
 	}
-
 }

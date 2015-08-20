@@ -3,7 +3,8 @@
 use std::sync::{Once, ONCE_INIT};
 use std::sync::mpsc::channel;
 use std::io;
-use std::io::{Read,Write};
+use std::io::{Read, Write};
+use std::error::Error;
 use std::thread;
 
 use env_logger;
@@ -31,7 +32,7 @@ fn test_stream() {
 					if error.kind() == io::ErrorKind::WouldBlock {
 						continue
 					}
-					panic!(error);
+					panic!("{:?} {:?}", error.kind(), error.description());
 				}
 			}
 		}

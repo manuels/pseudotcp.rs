@@ -12,4 +12,6 @@ libc = "*"
 log = "*"
 env_logger = "*"
 time = "*"
-condition_variable = "*"
+
+[dependencies.condition_variable]
+path = "../condition_variable"
