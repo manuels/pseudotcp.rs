@@ -16,9 +16,17 @@ const FIN:[u8;2] = [0xDE, 0xAD];
 pub struct PseudoTcpSocket;
 pub struct PseudoTcpChannel;
 
+#[derive(Clone,PartialEq)]
+enum ConnectState {
+	NotConnected,
+	Connected,
+	WasConnected,
+}
+
 pub struct PseudoTcpStream {
+	dbg:           String,
 	tcp:           Arc<Mutex<api::PseudoTcpSocket>>,
-	connected:     Arc<ConditionVariable<bool>>,
+	connected:     Arc<ConditionVariable<ConnectState>>,
 	readable:      Arc<ConditionVariable<bool>>,
 	writable:      Arc<ConditionVariable<bool>>,
 	notify_clock:  Arc<ConditionVariable<()>>,
@@ -26,25 +34,26 @@ pub struct PseudoTcpStream {
 
 impl PseudoTcpSocket {
 	/// waits for a connection in the background
-	pub fn listen(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>)) -> PseudoTcpStream {
-		PseudoTcpStream::new(ch)
+	pub fn listen(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>), dbg: String) -> PseudoTcpStream {
+		PseudoTcpStream::new(ch, dbg)
 	}
 
-	pub fn connect(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>)) -> io::Result<PseudoTcpStream> {
-		let stream = PseudoTcpStream::new(ch);
+	pub fn connect(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>), dbg: String) -> io::Result<PseudoTcpStream> {
+		let stream = PseudoTcpStream::new(ch, dbg);
 		
 		stream.connect().map(|_| stream)
 	}
 }
 
 impl PseudoTcpStream {
-	fn new(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>)) -> PseudoTcpStream {
+	fn new(ch: (Sender<Vec<u8>>, Receiver<Vec<u8>>), dbg: String) -> PseudoTcpStream {
 		let (tx, rx) = ch;
 
-		let connected = Arc::new(ConditionVariable::new(false));
+		let connected = Arc::new(ConditionVariable::new(ConnectState::NotConnected));
 		let readable  = Arc::new(ConditionVariable::new(false));
 		let writable  = Arc::new(ConditionVariable::new(false));
 
+		let debug = dbg.clone();
 		let callbacks = {
 			let tx         = tx.clone();
 			let readable   = readable.clone();
@@ -56,15 +65,15 @@ impl PseudoTcpStream {
 				match tx.send(buf.to_vec()) {
 					Ok(()) => ffi::WR_SUCCESS,
 					Err(err) => {
-						error!("{:?}", err);
+						error!("{} write_packet: {:?}", debug, err);
 						ffi::WR_FAIL
 					},
 				}
 			};
 
 			api::Callbacks {
-				opened:       Some(Box::new(move ||  connected1.set(true, Notify::All))),
-				aborted:      Some(Box::new(move |_| {connected2.set(false, Notify::All)})),
+				opened:       Some(Box::new(move ||  connected1.set(ConnectState::Connected, Notify::All))),
+				aborted:      Some(Box::new(move |_| {connected2.set(ConnectState::WasConnected, Notify::All)})),
 				readable:     Some(Box::new(move ||  readable.set(true, Notify::All))),
 				writable:     Some(Box::new(move ||  writable.set(true, Notify::All))),
 				write_packet: Some(Box::new(write_packet)),
@@ -76,6 +85,7 @@ impl PseudoTcpStream {
 		let notify_clock = Arc::new(ConditionVariable::new(()));
 
 		let socket = PseudoTcpStream {
+			dbg:           dbg,
 			tcp:           tcp,
 			readable:      readable,
 			writable:      writable,
@@ -102,7 +112,7 @@ impl PseudoTcpStream {
 	/// use this for the listening socket
 	pub fn wait_for_connection(&self, timeout_ms: i64) -> bool
 	{
-		self.connected.wait_for_ms(true, timeout_ms).unwrap()
+		self.connected.wait_for_ms(ConnectState::Connected, timeout_ms).unwrap()
 	}
 
 	pub fn close(&self, force: bool) {
@@ -143,11 +153,12 @@ impl PseudoTcpStream {
 		let readable     = self.readable.clone();
 		let tcp = self.tcp.clone();
 
+		let dbg = self.dbg.clone();
 		thread::spawn(move || {
 			let mut timer = Some(0);
-			
+
 			while let Some(timeout_ms) = timer {
-				debug!("clock: {:?}", timeout_ms);
+				warn!("{} clock: {:?}", dbg, timeout_ms);
 				(*notify_clock).wait_ms(timeout_ms as u32).unwrap();
 
 				timer = {
@@ -156,6 +167,10 @@ impl PseudoTcpStream {
 					lock.notify_clock();
 					lock.get_next_clock_ms()
 				};
+
+				if connected.get().unwrap() == ConnectState::WasConnected {
+					break
+				}
 			}
 			/* socket was closed. (see pseudo_tcp_socket_close() docs) */
 
@@ -166,16 +181,18 @@ impl PseudoTcpStream {
 			// libnice packets begin with the conversation id (0xFEED).
 			let _ = tx.send(FIN.to_vec());
 
-			debug!("tcp socket: finished closing socket.");
+			error!("{} spawn_clock: tcp socket: finished closing socket.", dbg);
 			readable.touch(Notify::All);
-			connected.set(false, Notify::All);
+			connected.set(ConnectState::WasConnected, Notify::All);
 		})
 	}
 
 	fn spawn_udp_receiver(&self, rx: Receiver<Vec<u8>>) -> thread::JoinHandle<()> {
 		let tcp = self.tcp.clone();
+		let connected = self.connected.clone();
 		let notify_clock = self.notify_clock.clone();
 
+		let dbg = self.dbg.clone();
 		thread::spawn(move || {
 			for buf in rx {
 				let lock = tcp.lock().unwrap();
@@ -200,7 +217,8 @@ impl PseudoTcpStream {
 
 			let lock = tcp.lock().unwrap();
 			lock.close(false);
-			info!("Socket was closed from remote!");
+			error!("{} spawn_udp_receiver: Socket was closed from remote!", dbg);
+			connected.set(ConnectState::WasConnected, Notify::All);
 		})
 	}
 
@@ -233,7 +251,7 @@ impl PseudoTcpStream {
 		let disconnected = match res {
 			Ok(len) if len == 0 => true,
 			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-				!self.connected.get().unwrap()
+				self.connected.get().unwrap() != ConnectState::Connected
 			},
 			_ => false,
 		};
@@ -308,39 +326,56 @@ impl PseudoTcpChannel {
 
 	fn spawn_tcp_sender(tcp: &Arc<PseudoTcpStream>, rx: Receiver<Vec<u8>>) -> thread::JoinHandle<()>
 	{
-		let tcp = tcp.clone();
+		let weak = Arc::downgrade(&tcp.clone());
 
+		let dbg = tcp.dbg.clone();
 		thread::spawn(move || {
-			tcp.connected.wait_for(true).unwrap();
+			debug!("foo");
+
+			if let Some(tcp) = weak.upgrade() {
+				tcp.connected.wait_for(ConnectState::Connected).unwrap();
+			}
 
 			let mut is_connected = true;
 
 			// TODO: how to close rx on FIN?
 			for buf in rx {
-				if !is_connected {
-					break
-				}
+				if let Some(tcp) = weak.upgrade() {
+					is_connected = tcp.connected.get().unwrap() == ConnectState::Connected;
 
-				let mut pos = 0;
+					if tcp.connected.get().unwrap() == ConnectState::WasConnected {
+						break
+					}
 
-				while pos < buf.len() {
-					let res = tcp.send(&buf[pos..]);
+					let mut pos = 0;
+					while pos < buf.len() {
+						let res = tcp.send(&buf[pos..]);
 
-					match res {
-						Ok(len) => pos += len,
-						Err(ref err) => {
-							match err.kind() {
-								io::ErrorKind::WouldBlock => tcp.writable.wait_for(true).unwrap(),
-								io::ErrorKind::NotConnected => is_connected = false,
-								_ => panic!("{:?}", err),
+						match res {
+							Ok(len) => pos += len,
+							Err(ref err) => {
+								match err.kind() {
+									io::ErrorKind::WouldBlock => tcp.writable.wait_for(true).unwrap(),
+									io::ErrorKind::NotConnected => is_connected = false,
+									_ => panic!("{:?}", err),
+								}
 							}
 						}
 					}
+				} else {
+					break
+				}
+
+				if !is_connected {
+					break
 				}
 			}
 
-			debug!("Closing stream.");
-			tcp.close(false);
+			error!("{} spawn_tcp_sender: Closing stream.", dbg);
+			weak.upgrade().map(|tcp| {
+				tcp.connected.set(ConnectState::WasConnected, Notify::All);
+				tcp.close(false)
+			});
 		})
 	}
 
@@ -348,39 +383,46 @@ impl PseudoTcpChannel {
 	{
 		let tcp = tcp.clone();
 
+		let dbg = tcp.dbg.clone();
 		thread::spawn(move || {
 			let mut buf = [0; 10*1024];
 
-			tcp.connected.wait_for(true).unwrap();
+			// TODO:
+			//tcp.connected.wait_for(true).unwrap();
 
 			// We cannot use tcp.connected here because there there might
 			// pending notify_packets that were not processed by PseudoTcpSocket
 			let mut is_connected = true;
 			while is_connected {
-				debug!("Recv()'ing...");
+				warn!("Recv()'ing...");
 				let res = tcp.recv(&mut buf);
-				debug!("Recv()'ed.");
+				warn!("Recv()'ed {:?}.", res);
 
 				match res {
 					Ok(len) => tx.send(buf[..len].to_vec()).unwrap(),
 					Err(ref err) => {
 						match err.kind() {
 							io::ErrorKind::WouldBlock => {
-								debug!("readable.wait_for...");
-								tcp.readable.wait_for_condition(|r|
-									*r || !tcp.connected.get().unwrap()
-								).unwrap();
+								if tcp.connected.get().unwrap() == ConnectState::WasConnected {
+									 break
+								}
 
-								is_connected = tcp.connected.get().unwrap();
+								warn!("readable.wait_for...");
+								tcp.readable.wait_for_condition(|r| {
+									warn!("readable.wait_for: {} {}", *r, tcp.connected.get().unwrap()!=ConnectState::Connected);
+									*r || tcp.connected.get().unwrap() == ConnectState::WasConnected
+								}).unwrap();
+
+								is_connected = tcp.connected.get().unwrap() == ConnectState::Connected;
 								debug!("readable.wait_for. done");
 							},
 							io::ErrorKind::NotConnected => is_connected = false,
-							_ => panic!("{:?}", err),
+							_ => error!("spawn_tcp_receiver {:?}", err),
 						}
 					}
 				}
 			}
-			debug!("Peer disconnected.");
+			error!("{} spawn_tcp_receiver: Peer disconnected.", dbg);
 		})
 	}
 }

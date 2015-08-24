@@ -45,8 +45,8 @@ fn test_stream() {
 
 	PseudoTcpStream::set_debug_level(ffi::PSEUDO_TCP_DEBUG_VERBOSE);
 
-	let mut bob   = PseudoTcpSocket::listen((tx_b, rx_b));
-	let mut alice = PseudoTcpSocket::connect((tx_a, rx_a)).unwrap();
+	let mut bob   = PseudoTcpSocket::listen((tx_b, rx_b), String::from("bob"));
+	let mut alice = PseudoTcpSocket::connect((tx_a, rx_a), String::from("alice")).unwrap();
 
 	alice.notify_mtu(1496);
 	bob.notify_mtu(1496);
@@ -150,14 +150,14 @@ fn test_channel() {
 
 	PseudoTcpStream::set_debug_level(ffi::PSEUDO_TCP_DEBUG_VERBOSE);
 
-	let bob   = PseudoTcpSocket::listen((tx_b, rx_b));
-	let alice = PseudoTcpSocket::connect((tx_a, rx_a)).unwrap();
+	let bob   = PseudoTcpSocket::listen((tx_b, rx_b), String::from("bob"));
+	let alice = PseudoTcpSocket::connect((tx_a, rx_a), String::from("alice")).unwrap();
 	bob.wait_for_connection(4000);
 
 	alice.notify_mtu(1496);
 	bob.notify_mtu(1496);
 
-	let n_iter = 100;
+	let n_iter = 1;
 
 	thread::spawn(move || {
 		let (tx, rx) = bob.to_channel();
@@ -165,6 +165,8 @@ fn test_channel() {
 		for buf in rx {
 			tx.send(buf).unwrap();
 		}
+
+		thread::sleep_ms(1000);
 		debug!("bob is done");
 	});
 
@@ -182,6 +184,7 @@ fn test_channel() {
 			read_count += buf.len();
 		}
 	}
+	thread::sleep_ms(1000);
 
 	for buf in rx {
 		read_count += buf.len();
