@@ -1,6 +1,6 @@
 [package]
 name = "pseudotcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "pseudo-TCP bindings for libnice"
 homepage = "https://github.com/manuels/pseudotcp.rs"
 license = " GPL-2.0"
@@ -12,6 +12,4 @@ libc = "*"
 log = "*"
 env_logger = "*"
 time = "*"
-
-[dependencies.condition_variable]
-path = "../condition_variable"
+condition_variable = "*"

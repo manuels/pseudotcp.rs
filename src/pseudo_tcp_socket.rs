@@ -413,15 +413,18 @@ impl PseudoTcpChannel {
 									*r || tcp.connected.get().unwrap() == ConnectState::WasConnected
 								}).unwrap();
 
-								is_connected = tcp.connected.get().unwrap() == ConnectState::Connected;
+								is_connected = tcp.connected.get().unwrap() != ConnectState::WasConnected;
 								debug!("readable.wait_for. done");
 							},
-							io::ErrorKind::NotConnected => is_connected = false,
+							io::ErrorKind::NotConnected =>
+								is_connected = tcp.connected.get().unwrap() != ConnectState::WasConnected,
 							_ => error!("spawn_tcp_receiver {:?}", err),
 						}
 					}
 				}
 			}
+
+			tcp.connected.set(ConnectState::WasConnected, Notify::All);
 			error!("{} spawn_tcp_receiver: Peer disconnected.", dbg);
 		})
 	}
