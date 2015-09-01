@@ -91,6 +91,8 @@ fn test_stream() {
 
 		thread::sleep_ms(500);
 	});
+	
+	alice.wait_for_connection(4000);
 
 	let mut write_count = 0;
 	let mut read_count = 0;

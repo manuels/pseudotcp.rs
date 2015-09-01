@@ -1,5 +1,6 @@
 use std::io;
 use std::io::{Read, Write};
+use std::io::ErrorKind::{NotConnected, WouldBlock};
 use std::thread;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, Receiver, channel};
@@ -16,7 +17,7 @@ const FIN:[u8;2] = [0xDE, 0xAD];
 pub struct PseudoTcpSocket;
 pub struct PseudoTcpChannel;
 
-#[derive(Clone,PartialEq)]
+#[derive(Clone,PartialEq,Debug)]
 enum ConnectState {
 	NotConnected,
 	Connected,
@@ -62,12 +63,12 @@ impl PseudoTcpStream {
 			let connected2 = connected.clone();
 
 			let write_packet = move |buf: &[u8]| {
-				match tx.send(buf.to_vec()) {
-					Ok(()) => ffi::WR_SUCCESS,
-					Err(err) => {
-						error!("{} write_packet: {:?}", debug, err);
-						ffi::WR_FAIL
-					},
+				let res = tx.send(buf.to_vec());
+				if let Err(err) = res {
+					error!("{} write_packet: {:?}", debug, err);
+					ffi::WR_FAIL
+				} else {
+					ffi::WR_SUCCESS
 				}
 			};
 
@@ -180,6 +181,7 @@ impl PseudoTcpStream {
 			// We do this by sending FIN (0xDEAD) over the wire. Usual
 			// libnice packets begin with the conversation id (0xFEED).
 			let _ = tx.send(FIN.to_vec());
+			thread::sleep_ms(500);
 
 			error!("{} spawn_clock: tcp socket: finished closing socket.", dbg);
 			readable.touch(Notify::All);
@@ -250,14 +252,14 @@ impl PseudoTcpStream {
 
 		let disconnected = match res {
 			Ok(len) if len == 0 => true,
-			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+			Err(ref e) if e.kind() == WouldBlock => {
 				self.connected.get().unwrap() != ConnectState::Connected
 			},
 			_ => false,
 		};
 
 		if disconnected {
-			let error = io::Error::new(io::ErrorKind::NotConnected, "");
+			let error = io::Error::new(NotConnected, "");
 			return Err(error);
 		}
 
@@ -278,7 +280,7 @@ impl PseudoTcpStream {
 				Ok(len) if len < buf.len() => {
 					self.writable.set(false, Notify::All);
 				},
-				Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+				Err(ref err) if err.kind() == WouldBlock => {
 					self.writable.set(false, Notify::All);
 				}
 				_ => (),
@@ -334,33 +336,25 @@ impl PseudoTcpChannel {
 
 		let dbg = tcp.dbg.clone();
 		thread::spawn(move || {
-			debug!("foo");
-
 			tcp.connected.wait_for(ConnectState::Connected).unwrap();
 
-			let mut is_connected;
+			let mut is_connected = true;
 
-			// TODO: how to close rx on FIN?
-			for buf in rx {
-				is_connected = tcp.connected.get().unwrap() == ConnectState::Connected;
-
-				if tcp.connected.get().unwrap() == ConnectState::WasConnected {
-					break
-				}
-
+			for buf in rx.iter().take_while(|_| tcp.is_connected()) {
 				let mut pos = 0;
-				while pos < buf.len() {
+				while pos < buf.len() && is_connected {
 					let res = tcp.send(&buf[pos..]);
+					let err_kind = res.as_ref().err().map(|e| e.kind());
 
-					match res {
-						Ok(len) => pos += len,
-						Err(ref err) => {
-							match err.kind() {
-								io::ErrorKind::WouldBlock => tcp.writable.wait_for(true).unwrap(),
-								io::ErrorKind::NotConnected => is_connected = false,
-								_ => panic!("{:?}", err),
-							}
-						}
+					match (res, err_kind) {
+						(Ok(len), _) => pos += len,
+						(Err(_), Some(NotConnected)) => is_connected = false,
+						(Err(_), Some(WouldBlock)) => {
+							tcp.writable.wait_for_condition(|w| {
+								*w || !tcp.is_connected()
+							});
+						},
+						(Err(err), _) => panic!("{:?}", err),
 					}
 				}
 
@@ -384,39 +378,29 @@ impl PseudoTcpChannel {
 			let mut buf = [0; 10*1024];
 
 			// TODO:
-			//tcp.connected.wait_for(true).unwrap();
+			tcp.connected.wait_for(ConnectState::Connected).unwrap();
 
 			// We cannot use tcp.connected here because there there might
 			// pending notify_packets that were not processed by PseudoTcpSocket
-			let mut is_connected = true;
-			while is_connected {
+			loop {
 				warn!("Recv()'ing...");
 				let res = tcp.recv(&mut buf);
+				let err_kind = res.as_ref().err().map(|e| e.kind());
 				warn!("Recv()'ed {:?}.", res);
 
-				match res {
-					Ok(len) => tx.send(buf[..len].to_vec()).unwrap(),
-					Err(ref err) => {
-						match err.kind() {
-							io::ErrorKind::WouldBlock => {
-								if tcp.connected.get().unwrap() == ConnectState::WasConnected {
-									 break
-								}
+				match (res, err_kind) {
+					(Ok(len), _) => tx.send(buf[..len].to_vec()).unwrap(),
+					(Err(_), Some(NotConnected)) => break,
+					(Err(_), Some(WouldBlock)) => {
+						warn!("readable.wait_for...");
+						tcp.readable.wait_for_condition(|r| {
+							warn!("readable.wait_for: {} {:?}", *r, tcp.connected.get().unwrap());
+							*r || !tcp.is_connected()
+						}).unwrap();
 
-								warn!("readable.wait_for...");
-								tcp.readable.wait_for_condition(|r| {
-									warn!("readable.wait_for: {} {}", *r, tcp.connected.get().unwrap()!=ConnectState::Connected);
-									*r || tcp.connected.get().unwrap() == ConnectState::WasConnected
-								}).unwrap();
-
-								is_connected = tcp.connected.get().unwrap() != ConnectState::WasConnected;
-								debug!("readable.wait_for. done");
-							},
-							io::ErrorKind::NotConnected =>
-								is_connected = tcp.connected.get().unwrap() != ConnectState::WasConnected,
-							_ => error!("spawn_tcp_receiver {:?}", err),
-						}
-					}
+						debug!("readable.wait_for. done");
+					},
+					(Err(err), _) => error!("spawn_tcp_receiver {:?}", err),
 				}
 			}
 
