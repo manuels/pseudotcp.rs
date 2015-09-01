@@ -73,7 +73,7 @@ impl PseudoTcpStream {
 
 			api::Callbacks {
 				opened:       Some(Box::new(move ||  connected1.set(ConnectState::Connected, Notify::All))),
-				aborted:      Some(Box::new(move |_| {connected2.set(ConnectState::WasConnected, Notify::All)})),
+				aborted:      Some(Box::new(move |_| connected2.set(ConnectState::WasConnected, Notify::All))),
 				readable:     Some(Box::new(move ||  readable.set(true, Notify::All))),
 				writable:     Some(Box::new(move ||  writable.set(true, Notify::All))),
 				write_packet: Some(Box::new(write_packet)),
@@ -294,6 +294,10 @@ impl PseudoTcpStream {
 	pub fn to_channel(self) -> (Sender<Vec<u8>>, Receiver<Vec<u8>>) {
 		PseudoTcpChannel::new(self)
 	}
+
+	pub fn is_connected(&self) -> bool {
+		self.connected.get().unwrap() == ConnectState::Connected
+	}
 }
 
 impl io::Read for PseudoTcpStream {
@@ -326,44 +330,38 @@ impl PseudoTcpChannel {
 
 	fn spawn_tcp_sender(tcp: &Arc<PseudoTcpStream>, rx: Receiver<Vec<u8>>) -> thread::JoinHandle<()>
 	{
-		let weak = Arc::downgrade(&tcp.clone());
+		let tcp = tcp.clone();
 
 		let dbg = tcp.dbg.clone();
 		thread::spawn(move || {
 			debug!("foo");
 
-			if let Some(tcp) = weak.upgrade() {
-				tcp.connected.wait_for(ConnectState::Connected).unwrap();
-			}
+			tcp.connected.wait_for(ConnectState::Connected).unwrap();
 
-			let mut is_connected = true;
+			let mut is_connected;
 
 			// TODO: how to close rx on FIN?
 			for buf in rx {
-				if let Some(tcp) = weak.upgrade() {
-					is_connected = tcp.connected.get().unwrap() == ConnectState::Connected;
+				is_connected = tcp.connected.get().unwrap() == ConnectState::Connected;
 
-					if tcp.connected.get().unwrap() == ConnectState::WasConnected {
-						break
-					}
+				if tcp.connected.get().unwrap() == ConnectState::WasConnected {
+					break
+				}
 
-					let mut pos = 0;
-					while pos < buf.len() {
-						let res = tcp.send(&buf[pos..]);
+				let mut pos = 0;
+				while pos < buf.len() {
+					let res = tcp.send(&buf[pos..]);
 
-						match res {
-							Ok(len) => pos += len,
-							Err(ref err) => {
-								match err.kind() {
-									io::ErrorKind::WouldBlock => tcp.writable.wait_for(true).unwrap(),
-									io::ErrorKind::NotConnected => is_connected = false,
-									_ => panic!("{:?}", err),
-								}
+					match res {
+						Ok(len) => pos += len,
+						Err(ref err) => {
+							match err.kind() {
+								io::ErrorKind::WouldBlock => tcp.writable.wait_for(true).unwrap(),
+								io::ErrorKind::NotConnected => is_connected = false,
+								_ => panic!("{:?}", err),
 							}
 						}
 					}
-				} else {
-					break
 				}
 
 				if !is_connected {
@@ -372,10 +370,8 @@ impl PseudoTcpChannel {
 			}
 
 			error!("{} spawn_tcp_sender: Closing stream.", dbg);
-			weak.upgrade().map(|tcp| {
-				tcp.connected.set(ConnectState::WasConnected, Notify::All);
-				tcp.close(false)
-			});
+			tcp.connected.set(ConnectState::WasConnected, Notify::All);
+			tcp.close(false);
 		})
 	}
 

@@ -1,4 +1,3 @@
-#![feature(arc_weak)]
 #![allow(dead_code)]
 
 #[macro_use]
