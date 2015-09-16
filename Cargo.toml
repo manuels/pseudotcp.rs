@@ -1,6 +1,6 @@
 [package]
 name = "pseudotcp"
-version = "0.1.2"
+version = "0.1.3"
 description = "pseudo-TCP bindings for libnice"
 homepage = "https://github.com/manuels/pseudotcp.rs"
 license = " GPL-2.0"

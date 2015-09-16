@@ -159,7 +159,7 @@ impl PseudoTcpStream {
 			let mut timer = Some(0);
 
 			while let Some(timeout_ms) = timer {
-				warn!("{} clock: {:?}", dbg, timeout_ms);
+				debug!("{} clock: {:?}", dbg, timeout_ms);
 				(*notify_clock).wait_ms(timeout_ms as u32).unwrap();
 
 				timer = {
@@ -209,7 +209,7 @@ impl PseudoTcpStream {
 				} else {
 					let res = lock.notify_packet(&buf[..]);
 					if !res {
-						warn!("notify_packet failed!");
+						debug!("notify_packet failed!");
 					}
 				}
 
@@ -232,20 +232,20 @@ impl PseudoTcpStream {
 
 		let res = {
 			let lock = self.tcp.lock().unwrap();
-			let res = lock.recv(buf);
+			lock.recv(buf)
+		};
 
-			if let Err(err) = res {
-				if err.raw_os_error() == Some(EAGAIN) {
-					// We must keep the lock to ensure that readable callback
-					// is not called before we set self.readable to false!
-					self.readable.set(false, Notify::All);
-				} else {
-					debug!("pseudo_tcp_socket_recv()=={:?}", err);
-				}
-				Err(err)
+		let res = if let Err(err) = res {
+			if err.raw_os_error() == Some(EAGAIN) {
+				// We must keep the lock to ensure that readable callback
+				// is not called before we set self.readable to false!
+				self.readable.set(false, Notify::All);
 			} else {
-				res
+				debug!("pseudo_tcp_socket_recv()=={:?}", err);
 			}
+			Err(err)
+		} else {
+			res
 		};
 
 		self.adjust_clock();
@@ -274,20 +274,19 @@ impl PseudoTcpStream {
 
 		let res = {
 			let lock = self.tcp.lock().unwrap();
-			let res = lock.send(buf);
-
-			match res {
-				Ok(len) if len < buf.len() => {
-					self.writable.set(false, Notify::All);
-				},
-				Err(ref err) if err.kind() == WouldBlock => {
-					self.writable.set(false, Notify::All);
-				}
-				_ => (),
-			}
-
-			res
+			lock.send(buf)
 		};
+
+		match res {
+			Ok(len) if len < buf.len() => {
+				self.writable.set(false, Notify::All);
+			},
+			Err(ref err) if err.kind() == WouldBlock => {
+				self.writable.set(false, Notify::All);
+			}
+			_ => (),
+		}
+
 		self.adjust_clock();
 
 		res
@@ -383,18 +382,18 @@ impl PseudoTcpChannel {
 			// We cannot use tcp.connected here because there there might
 			// pending notify_packets that were not processed by PseudoTcpSocket
 			loop {
-				warn!("Recv()'ing...");
+				debug!("Recv()'ing...");
 				let res = tcp.recv(&mut buf);
 				let err_kind = res.as_ref().err().map(|e| e.kind());
-				warn!("Recv()'ed {:?}.", res);
+				debug!("Recv()'ed {:?}.", res);
 
 				match (res, err_kind) {
 					(Ok(len), _) => tx.send(buf[..len].to_vec()).unwrap(),
 					(Err(_), Some(NotConnected)) => break,
 					(Err(_), Some(WouldBlock)) => {
-						warn!("readable.wait_for...");
+						debug!("readable.wait_for...");
 						tcp.readable.wait_for_condition(|r| {
-							warn!("readable.wait_for: {} {:?}", *r, tcp.connected.get().unwrap());
+							debug!("readable.wait_for: {} {:?}", *r, tcp.connected.get().unwrap());
 							*r || !tcp.is_connected()
 						}).unwrap();
 

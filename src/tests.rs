@@ -9,6 +9,7 @@ use std::thread;
 
 use env_logger;
 
+use time::{SteadyTime, Duration};
 use pseudo_tcp_socket::{PseudoTcpStream, PseudoTcpSocket};
 use bindings as ffi;
 
@@ -201,4 +202,107 @@ fn test_channel() {
 	info!("alice done and read {} bytes.", read_count);
 
 	assert_eq!(read_count, write_count);
+}
+
+#[test]
+fn test_benchmark() {
+	START.call_once(|| {
+		env_logger::init().unwrap();
+	});
+
+	fn send(tcp: &mut PseudoTcpStream, buf: &[u8]) -> usize {
+		let mut pos = 0;
+
+		while pos < buf.len() {
+			match tcp.write(&buf[pos..]) {
+				Ok(len) => {
+					pos += len;
+				},
+				Err(error) => {
+					if error.kind() == io::ErrorKind::WouldBlock {
+						continue
+					}
+					panic!("{:?} {:?}", error.kind(), error.description());
+				}
+			}
+		}
+
+		buf.len()
+	}
+
+	let (tx_a, rx_b) = channel();
+	let (tx_b, rx_a) = channel();
+
+	PseudoTcpStream::set_debug_level(ffi::PSEUDO_TCP_DEBUG_VERBOSE);
+
+	let mut bob   = PseudoTcpSocket::listen((tx_b, rx_b), String::from("bob"));
+	let mut alice = PseudoTcpSocket::connect((tx_a, rx_a), String::from("alice")).unwrap();
+
+	alice.notify_mtu(1496);
+	bob.notify_mtu(1496);
+
+	thread::spawn(move || {
+		bob.wait_for_connection(4000);
+
+		let mut count = 0;
+		let mut total_count = 0;
+		let mut is_connected = true;
+
+		let start = SteadyTime::now();
+		let mut last_print = start;
+
+		while is_connected && SteadyTime::now() - start < Duration::seconds(60) {
+			let mut buf = vec![0; 10*1024];
+
+			if SteadyTime::now() - last_print > Duration::seconds(1) {
+				println!("bob recevied {} bytes in {} sec => {} KB/sec", count, SteadyTime::now() - last_print,
+					(count as i64)/1000/(SteadyTime::now() - last_print).num_seconds());
+				total_count += count;
+				count = 0;
+				last_print = SteadyTime::now();
+			}
+
+			match bob.read(&mut buf[..]) {
+				Ok(len)  => {
+					buf.truncate(len);
+
+					assert!(buf.len() > 0);
+					assert!(buf.iter().all(|x| *x == 0x0));
+
+					count += buf.len();
+				}
+				Err(err) => {
+					debug!("bob.read = {:?}", err);
+					thread::sleep_ms(100);
+
+					match err.kind() {
+						io::ErrorKind::WouldBlock => continue,
+						io::ErrorKind::NotConnected => is_connected = false,
+						_ => panic!(err),
+					}
+				}
+			}
+		}
+		println!("bob recevied {} bytes in {} sec => {} bytes/sec", total_count, SteadyTime::now() - start,
+			(total_count as i64)/(SteadyTime::now() - start).num_seconds());
+
+		bob.close(false);
+
+		thread::sleep_ms(500);
+	});
+	
+	alice.wait_for_connection(4000);
+
+	let mut write_count = 0;
+	let mut read_count = 0;
+
+	let mut i = 0;
+	let mut is_connected = true;
+	while is_connected {
+		let mut buf = vec![0; 10*1024];
+
+		write_count += send(&mut alice, &buf[..]);
+	}
+
+	info!("alice done and sent {} bytes.", write_count);
 }
