@@ -5,7 +5,7 @@ use std::thread;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Sender, Receiver, channel};
 
-use libc::consts::os::posix88::EAGAIN;
+use libc::EAGAIN;
 
 use api;
 use bindings as ffi;
