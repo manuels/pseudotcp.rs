@@ -6,7 +6,6 @@ extern crate bitflags;
 extern crate log;
 extern crate libc;
 extern crate env_logger;
-extern crate time;
 extern crate condition_variable;
 
 mod bindings;

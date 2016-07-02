@@ -5,7 +5,7 @@ extern crate libc;
 pub const FALSE: libc::c_int = 0;
 pub const TRUE:  libc::c_int = !FALSE;
 
-pub const EAGAIN:  libc::c_int = 11;
+pub const EAGAIN: libc::c_int = 11;
 
 /*
 struct _PseudoTcpSocketClass
@@ -227,50 +227,50 @@ extern "C" {
 /*
 enum  {
 	PSEUDO_TCP_DEBUG_NONE =	0x00000000 (0)
-	PSEUDO_TCP_DEBUG_NORMAL =	0x00000001 (1)
-	PSEUDO_TCP_DEBUG_VERBOSE =	0x00000002 (2)
+	PSEUDO_TCP_DEBUG_NORMAL = 0x00000001 (1)
+	PSEUDO_TCP_DEBUG_VERBOSE = 0x00000002 (2)
 }
 */
 bitflags! {
-	flags PseudoTcpDebugLevel: libc::c_uint {
-		const PSEUDO_TCP_DEBUG_NONE =	0 as libc::c_uint,
-		const PSEUDO_TCP_DEBUG_NORMAL =	1 as libc::c_uint,
-		const PSEUDO_TCP_DEBUG_VERBOSE =	2 as libc::c_uint,
+	pub flags PseudoTcpDebugLevel: libc::c_uint {
+		const PSEUDO_TCP_DEBUG_NONE = 0 as libc::c_uint,
+		const PSEUDO_TCP_DEBUG_NORMAL = 1 as libc::c_uint,
+		const PSEUDO_TCP_DEBUG_VERBOSE = 2 as libc::c_uint,
 	}
 }
 
 
 /*
 enum  {
-	TCP_LISTEN =	0x00000000 (0)
-	TCP_SYN_SENT =	0x00000001 (1)
-	TCP_SYN_RECEIVED =	0x00000002 (2)
-	TCP_ESTABLISHED =	0x00000003 (3)
-	TCP_CLOSED =	0x00000004 (4)
+	TCP_LISTEN = 0x00000000 (0)
+	TCP_SYN_SENT = 0x00000001 (1)
+	TCP_SYN_RECEIVED = 0x00000002 (2)
+	TCP_ESTABLISHED = 0x00000003 (3)
+	TCP_CLOSED = 0x00000004 (4)
 }
 */
 bitflags! {
-	flags PseudoTcpState: libc::c_uint {
-		const TCP_LISTEN =	0 as libc::c_uint,
-		const TCP_SYN_SENT =	1 as libc::c_uint,
-		const TCP_SYN_RECEIVED =	2 as libc::c_uint,
-		const TCP_ESTABLISHED =	3 as libc::c_uint,
-		const TCP_CLOSED =	4 as libc::c_uint,
+	pub flags PseudoTcpState: libc::c_uint {
+		const TCP_LISTEN = 0 as libc::c_uint,
+		const TCP_SYN_SENT = 1 as libc::c_uint,
+		const TCP_SYN_RECEIVED = 2 as libc::c_uint,
+		const TCP_ESTABLISHED = 3 as libc::c_uint,
+		const TCP_CLOSED = 4 as libc::c_uint,
 	}
 }
 
 /*
 enum  {
-	WR_SUCCESS =	0x00000000 (0)
-	WR_TOO_LARGE =	0x00000001 (1)
-	WR_FAIL =	0x00000002 (2)
+	WR_SUCCESS = 0x00000000 (0)
+	WR_TOO_LARGE = 0x00000001 (1)
+	WR_FAIL = 0x00000002 (2)
 }
 */
 bitflags! {
-	flags PseudoTcpWriteResult: libc::c_uint {
-		const WR_SUCCESS =	0 as libc::c_uint,
-		const WR_TOO_LARGE =	1 as libc::c_uint,
-		const WR_FAIL =	2 as libc::c_uint,
+	pub flags PseudoTcpWriteResult: libc::c_uint {
+		const WR_SUCCESS = 0 as libc::c_uint,
+		const WR_TOO_LARGE = 1 as libc::c_uint,
+		const WR_FAIL = 2 as libc::c_uint,
 	}
 }
 

@@ -9,7 +9,7 @@ use std::thread;
 
 use env_logger;
 
-use time::{SteadyTime, Duration};
+use std::time::{Instant, Duration};
 use pseudo_tcp_socket::{PseudoTcpStream, PseudoTcpSocket};
 use bindings as ffi;
 
@@ -76,7 +76,7 @@ fn test_stream() {
 				}
 				Err(err) => {
 					debug!("bob.read = {:?}", err);
-					thread::sleep_ms(100);
+					thread::sleep(Duration::from_millis(100));
 
 					match err.kind() {
 						io::ErrorKind::WouldBlock => continue,
@@ -90,7 +90,7 @@ fn test_stream() {
 
 		bob.close(false);
 
-		thread::sleep_ms(500);
+		thread::sleep(Duration::from_millis(500));
 	});
 	
 	alice.wait_for_connection(4000);
@@ -107,7 +107,7 @@ fn test_stream() {
 			write_count += send(&mut alice, &buf[..]);
 		} else if i == n_iter {
 			// give bob time to reply the data sent last
-			thread::sleep_ms(1000);
+			thread::sleep(Duration::from_millis(1000));
 
 			debug!("alice.close()");
 			alice.close(false);
@@ -125,7 +125,7 @@ fn test_stream() {
 			},
 			Err(err) => {
 				debug!("alice.read = {:?}", err);
-				thread::sleep_ms(100);
+				thread::sleep(Duration::from_millis(100));
 
 				match err.kind() {
 					io::ErrorKind::WouldBlock => continue,
@@ -169,7 +169,7 @@ fn test_channel() {
 			tx.send(buf).unwrap();
 		}
 
-		thread::sleep_ms(1000);
+		thread::sleep(Duration::from_millis(1000));
 		debug!("bob is done");
 	});
 
@@ -187,7 +187,7 @@ fn test_channel() {
 			read_count += buf.len();
 		}
 	}
-	thread::sleep_ms(1000);
+	thread::sleep(Duration::from_millis(1000));
 
 	for buf in rx {
 		read_count += buf.len();
@@ -197,7 +197,7 @@ fn test_channel() {
 		}
 	}
 
-	thread::sleep_ms(1000);
+	thread::sleep(Duration::from_millis(1000));
 	info!("alice done and sent {} bytes.", write_count);
 	info!("alice done and read {} bytes.", read_count);
 
@@ -248,18 +248,18 @@ fn test_benchmark() {
 		let mut total_count = 0;
 		let mut is_connected = true;
 
-		let start = SteadyTime::now();
+		let start = Instant::now();
 		let mut last_print = start;
 
-		while is_connected && SteadyTime::now() - start < Duration::seconds(60) {
+		while is_connected && start.elapsed() < Duration::from_secs(60) {
 			let mut buf = vec![0; 10*1024];
 
-			if SteadyTime::now() - last_print > Duration::seconds(1) {
-				println!("bob recevied {} bytes in {} sec => {} KB/sec", count, SteadyTime::now() - last_print,
-					(count as i64)/1000/(SteadyTime::now() - last_print).num_seconds());
+			let last_elapsed = last_print.elapsed().as_secs();
+			if last_elapsed > 0 {
+				println!("bob received {} bytes in {} sec", count, last_elapsed);
 				total_count += count;
 				count = 0;
-				last_print = SteadyTime::now();
+				last_print = Instant::now();
 			}
 
 			match bob.read(&mut buf[..]) {
@@ -273,7 +273,7 @@ fn test_benchmark() {
 				}
 				Err(err) => {
 					debug!("bob.read = {:?}", err);
-					thread::sleep_ms(100);
+					thread::sleep(Duration::from_millis(100));
 
 					match err.kind() {
 						io::ErrorKind::WouldBlock => continue,
@@ -283,12 +283,13 @@ fn test_benchmark() {
 				}
 			}
 		}
-		println!("bob recevied {} bytes in {} sec => {} bytes/sec", total_count, SteadyTime::now() - start,
-			(total_count as i64)/(SteadyTime::now() - start).num_seconds());
+		let elapsed_secs = start.elapsed().as_secs();
+		println!("bob received {} bytes in {} sec => {} bytes/sec", total_count, elapsed_secs,
+			(total_count as u64)/elapsed_secs);
 
 		bob.close(false);
 
-		thread::sleep_ms(500);
+		thread::sleep(Duration::from_millis(500));
 	});
 	
 	alice.wait_for_connection(4000);
